@@ -1517,5 +1517,191 @@ const d13 = solver.planEmergencyDeliveryStations(delNet, {
 });
 check('出口节点不存在时透传核验错误', d13.status === 'invalid');
 
+// ============ 检修阀门操作时段审计 ============
+console.log('检修阀门操作时段审计：');
+
+const auditBase = { supplies: ['S1', 'S2'], leak: 'N2', outlets: ['B', 'C', 'D'] };
+
+const au1 = solver.auditValveOperationWindow(network, {
+  ...auditBase,
+  startMinute: 0,
+  endMinute: 40,
+  records: [
+    { minute: 5, valve: 'V03', open: false },
+    { minute: 5, valve: 'V04', open: false },
+    { minute: 5, valve: 'V05', open: false },
+    { minute: 30, valve: 'V03', open: true },
+    { minute: 30, valve: 'V04', open: true },
+    { minute: 35, valve: 'V08', open: false },
+  ],
+});
+check('审计返回 ok', au1.status === 'ok');
+check('记录数与变更次数（6 条记录 → 3 次原子变更）',
+  au1.status === 'ok' && au1.recordCount === 6 && au1.changes.length === 3);
+check('漏点带压时段 [0,5) 与 [30,40)', au1.status === 'ok' &&
+  au1.leakPressurizedIntervals.length === 2 &&
+  au1.leakPressurizedIntervals[0].from === 0 && au1.leakPressurizedIntervals[0].to === 5 &&
+  au1.leakPressurizedIntervals[1].from === 30 && au1.leakPressurizedIntervals[1].to === 40);
+check('漏点带压累计 15 分钟', au1.status === 'ok' && au1.leakPressurizedMinutes === 15);
+const rowOf = (r, name) => r.outletRows.find((x) => x.outlet === name);
+check('出口 C 断水 [5,30) 共 25 分钟', au1.status === 'ok' &&
+  rowOf(au1, 'C').outageMinutes === 25 &&
+  rowOf(au1, 'C').outageIntervals.length === 1 &&
+  rowOf(au1, 'C').outageIntervals[0].from === 5 &&
+  rowOf(au1, 'C').outageIntervals[0].to === 30);
+check('出口 D 与 C 同时段断水', au1.status === 'ok' && rowOf(au1, 'D').outageMinutes === 25);
+check('出口 B 关 V08 后（V09 登记为关）断水 [35,40) 共 5 分钟', au1.status === 'ok' &&
+  rowOf(au1, 'B').outageMinutes === 5 &&
+  rowOf(au1, 'B').outageIntervals[0].from === 35 &&
+  rowOf(au1, 'B').outageIntervals[0].to === 40);
+check('断水分钟合计 55', au1.status === 'ok' && au1.totalOutageMinutes === 55);
+check('时间轴分段数 = 变更数 + 1', au1.status === 'ok' && au1.segments.length === 4);
+check('同分钟不同阀门合并为一次原子变更且按阀门编号升序', au1.status === 'ok' &&
+  au1.changes[0].minute === 5 &&
+  au1.changes[0].operations.map((o) => o.valve).join(',') === 'V03,V04,V05' &&
+  au1.changes[0].operations[0].fromOpen === true &&
+  au1.changes[0].operations[0].toOpen === false);
+
+// 空日志：整段按登记状态覆盖
+const au2 = solver.auditValveOperationWindow(network, {
+  ...auditBase,
+  startMinute: 0,
+  endMinute: 40,
+  records: [],
+});
+check('空日志返回 ok 且零变更', au2.status === 'ok' && au2.changes.length === 0 && au2.segments.length === 1);
+check('空日志漏点整段带压 [0,40)', au2.status === 'ok' &&
+  au2.leakPressurizedIntervals.length === 1 &&
+  au2.leakPressurizedIntervals[0].from === 0 &&
+  au2.leakPressurizedIntervals[0].to === 40 &&
+  au2.leakPressurizedMinutes === 40);
+check('空日志各出口不断水', au2.status === 'ok' && au2.totalOutageMinutes === 0);
+
+// 相邻同类区间合并：关 V07（仅影响叶子 D），漏点全程带压 → 合并为单段 [0,40)
+const au3 = solver.auditValveOperationWindow(network, {
+  ...auditBase,
+  startMinute: 0,
+  endMinute: 40,
+  records: [
+    { minute: 5, valve: 'V07', open: false },
+    { minute: 10, valve: 'V07', open: true },
+  ],
+});
+check('漏点不受影响时带压时段相邻合并为 [0,40)', au3.status === 'ok' &&
+  au3.leakPressurizedIntervals.length === 1 &&
+  au3.leakPressurizedIntervals[0].from === 0 &&
+  au3.leakPressurizedIntervals[0].to === 40);
+check('出口 D 断水 [5,10) 共 5 分钟', au3.status === 'ok' && rowOf(au3, 'D').outageMinutes === 5);
+
+// 无变化操作（开→开）仍记录为一次变更
+const au4 = solver.auditValveOperationWindow(network, {
+  ...auditBase,
+  startMinute: 0,
+  endMinute: 10,
+  records: [{ minute: 3, valve: 'V01', open: true }],
+});
+check('目标状态与当前相同的操作仍记一次变更', au4.status === 'ok' &&
+  au4.changes.length === 1 &&
+  au4.changes[0].operations[0].fromOpen === true &&
+  au4.changes[0].operations[0].toOpen === true);
+
+// 零长度区间 [5,5)
+const au5 = solver.auditValveOperationWindow(network, {
+  ...auditBase,
+  startMinute: 5,
+  endMinute: 5,
+  records: [],
+});
+check('零长度区间返回 ok、总分钟 0、无分段', au5.status === 'ok' &&
+  au5.totalMinutes === 0 && au5.segments.length === 0 && au5.leakPressurizedMinutes === 0);
+
+// 错误：同分钟重复操作同一阀门
+const eu1 = solver.auditValveOperationWindow(network, {
+  ...auditBase,
+  startMinute: 0,
+  endMinute: 40,
+  records: [
+    { minute: 5, valve: 'V03', open: false },
+    { minute: 5, valve: 'V03', open: true },
+  ],
+});
+check('同分钟重复操作同一阀门报错', eu1.status === 'invalid' &&
+  eu1.errors.some((x) => x.includes('重复') && x.includes('V03')));
+
+// 错误：未知阀门
+const eu2 = solver.auditValveOperationWindow(network, {
+  ...auditBase,
+  startMinute: 0,
+  endMinute: 40,
+  records: [{ minute: 5, valve: 'V99', open: false }],
+});
+check('未知阀门报错', eu2.status === 'invalid' && eu2.errors.some((x) => x.includes('V99')));
+
+// 错误：越界时间（分钟 = 结束分钟，区间左闭右开）
+const eu3 = solver.auditValveOperationWindow(network, {
+  ...auditBase,
+  startMinute: 0,
+  endMinute: 40,
+  records: [{ minute: 40, valve: 'V03', open: false }],
+});
+check('分钟等于结束分钟（右边界）报越界', eu3.status === 'invalid' && eu3.errors.some((x) => x.includes('越界')));
+const eu3b = solver.auditValveOperationWindow(network, {
+  ...auditBase,
+  startMinute: 10,
+  endMinute: 40,
+  records: [{ minute: 9, valve: 'V03', open: false }],
+});
+check('分钟早于起始分钟报越界', eu3b.status === 'invalid' && eu3b.errors.some((x) => x.includes('越界')));
+
+// 错误：起 > 止、非整数、open 非布尔、记录超 100 条
+const eu4 = solver.auditValveOperationWindow(network, {
+  ...auditBase, startMinute: 40, endMinute: 10, records: [],
+});
+check('起始晚于结束报错', eu4.status === 'invalid');
+const eu5 = solver.auditValveOperationWindow(network, {
+  ...auditBase, startMinute: 1.5, endMinute: 10, records: [],
+});
+check('起始分钟为小数报错', eu5.status === 'invalid');
+const eu6 = solver.auditValveOperationWindow(network, {
+  ...auditBase,
+  startMinute: 0,
+  endMinute: 40,
+  records: [{ minute: 5, valve: 'V03', open: 'false' }],
+});
+check('open 非布尔报错', eu6.status === 'invalid' && eu6.errors.some((x) => x.includes('open')));
+const eu7 = solver.auditValveOperationWindow(network, {
+  ...auditBase,
+  startMinute: 0,
+  endMinute: 1000,
+  records: Array.from({ length: 101 }, (_, i) => ({ minute: i, valve: 'V03', open: i % 2 === 0 })),
+});
+check('记录超过 100 条报错', eu7.status === 'invalid' && eu7.errors.some((x) => x.includes('100')));
+
+// 保供出口顺序按查询去重顺序给出
+const au6 = solver.auditValveOperationWindow(network, {
+  supplies: ['S1', 'S2'],
+  leak: 'N2',
+  outlets: ['D', 'D', 'C', 'B'],
+  startMinute: 0,
+  endMinute: 40,
+  records: [{ minute: 5, valve: 'V07', open: false }],
+});
+check('出口按查询顺序去重', au6.status === 'ok' &&
+  au6.outlets.join(',') === 'D,C,B' &&
+  au6.outletRows.map((r) => r.outlet).join(',') === 'D,C,B');
+
+// 纯函数：不修改拓扑与登记状态、不修改入参记录
+const beforeAuditNet = JSON.stringify(network);
+const auditRecordsInput = [
+  { minute: 5, valve: 'V03', open: false },
+  { minute: 30, valve: 'V03', open: true },
+];
+solver.auditValveOperationWindow(network, {
+  ...auditBase, startMinute: 0, endMinute: 40, records: auditRecordsInput,
+});
+check('审计不修改拓扑与登记状态', JSON.stringify(network) === beforeAuditNet);
+check('审计不修改入参记录', auditRecordsInput.length === 2 &&
+  auditRecordsInput[0].minute === 5 && auditRecordsInput[0].open === false);
+
 console.log(`\n${passed} 通过, ${failed} 失败`);
 process.exit(failed > 0 ? 1 : 0);

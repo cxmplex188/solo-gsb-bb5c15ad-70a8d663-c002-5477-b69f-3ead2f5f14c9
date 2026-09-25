@@ -13,6 +13,7 @@ import {
   parseWorkPassage,
   planClosureRoute,
   planEmergencyDeliveryStations,
+  auditValveOperationWindow,
   MAX_OPEN_VALVES,
   EXPANSION_TARGET_CAPACITY,
   MAX_EXPANSION_PIPES,
@@ -22,6 +23,7 @@ import {
   MAX_REOPEN_VALVES,
   MAX_ROUTE_VALVES,
   MAX_DELIVERY_STATIONS,
+  MAX_VALVE_AUDIT_RECORDS,
   type Query,
   type CapacityQuery,
   type AnomalyQuery,
@@ -40,6 +42,7 @@ import {
   type ObserverHypothesis,
   type ReopenResult,
   type EmergencyDeliveryResult,
+  type ValveAuditResult,
 } from './solver';
 import {
   SAMPLE_NETWORK,
@@ -56,6 +59,9 @@ import {
   SAMPLE_DELIVERY_CAPS,
   SAMPLE_DELIVERY_MAX_WALK,
   SAMPLE_OUTLET_WAYPOINTS,
+  SAMPLE_VALVE_AUDIT_START,
+  SAMPLE_VALVE_AUDIT_END,
+  SAMPLE_VALVE_AUDIT_RECORDS,
 } from './sample';
 
 const app = document.querySelector<HTMLDivElement>('#app')!;
@@ -81,7 +87,11 @@ app.innerHTML = `
       同分按阀门编号序列字典序取舍，必访阀门最多 ${MAX_ROUTE_VALVES} 个），
       还能做「应急送水站布点」（沿用当前拓扑、供水能力填写表与作业通道 JSON，以核验给出的各出口缺口为待送水量，
       枚举最多 ${MAX_DELIVERY_STATIONS} 个候选站的子集，按最短步行距离建立可服务关系、用容量流分配整数送水量，
-      选能补齐全部缺口且站数最少的方案，同数按站点名称升序列表字典序；无解时列出未补齐出口，缺口全为 0 时提示无需布点）。
+      选能补齐全部缺口且站数最少的方案，同数按站点名称升序列表字典序；无解时列出未补齐出口，缺口全为 0 时提示无需布点），
+      还能做「检修阀门操作时段审计」（沿用当前拓扑、供水点、漏点与保供出口，输入起止整数分钟与最多
+      ${MAX_VALVE_AUDIT_RECORDS} 条实际阀门操作记录，从登记状态起按分钟回放：同分钟不同阀门作为一次原子变更，
+      同分钟重复操作同一阀门、未知阀门或越界时间报错；以左闭右开区间给出漏点带压时段与逐出口断水时段及累计断水分钟；
+      空日志按登记状态覆盖整段，测算不改原始状态）。
       组合搜索最多覆盖 ${MAX_OPEN_VALVES} 个当前开启的阀门；求解过程不修改输入中的阀门状态。
     </p>
   </header>
@@ -245,6 +255,33 @@ app.innerHTML = `
       <div class="button-row">
         <button id="plan-delivery" type="button" class="secondary">规划应急送水站布点</button>
       </div>
+      <h2>8. 检修阀门操作时段审计</h2>
+      <p class="hint">
+        沿用当前拓扑、上方<strong>供水点</strong>、<strong>漏点</strong>与<strong>保供出口</strong>：
+        填写审计<strong>起止整数分钟</strong>（区间左闭右开）与<strong>最多 ${MAX_VALVE_AUDIT_RECORDS} 条实际操作记录</strong>
+        （JSON 数组，每项含 <code>minute</code> 分钟、<code>valve</code> 阀门编号、<code>open</code> 目标开闭，无需按分钟排序）。
+        从阀门<strong>登记状态</strong>起按分钟回放：同分钟对不同阀门的操作作为<strong>一次原子变更</strong>（同时生效后才重算可达）；
+        <strong>同分钟重复操作同一阀门、未知阀门或越界时间</strong>（分钟不在 [起, 止) 内）一律报错。
+        空日志（<code>[]</code> 或留空）按登记状态覆盖整段；测算<strong>不改原始状态</strong>。
+      </p>
+      <div class="fields">
+        <label>
+          起始整数分钟（含）
+          <input id="audit-start" type="number" min="0" step="1" inputmode="numeric" placeholder="如：0" />
+        </label>
+        <label>
+          结束整数分钟（不含）
+          <input id="audit-end" type="number" min="0" step="1" inputmode="numeric" placeholder="如：60" />
+        </label>
+      </div>
+      <label>
+        实际操作记录 JSON（数组，每项含 minute / valve / open；最多 ${MAX_VALVE_AUDIT_RECORDS} 条）
+        <textarea id="valve-audit-log" class="sub-textarea" spellcheck="false"
+          placeholder='[{"minute":5,"valve":"V03","open":false}]'></textarea>
+      </label>
+      <div class="button-row">
+        <button id="run-valve-audit" type="button" class="secondary">审计阀门操作时段</button>
+      </div>
     </section>
     <div class="side-column">
       <section class="panel result-panel">
@@ -349,6 +386,16 @@ app.innerHTML = `
           </p>
         </div>
       </section>
+      <section class="panel result-panel">
+        <h2>检修阀门操作时段审计</h2>
+        <div id="valve-audit-result">
+          <p class="hint">
+            填好起止整数分钟与实际操作记录 JSON 后点击「审计阀门操作时段」，这里从登记状态起按分钟回放，
+            以左闭右开区间给出漏点仍连通供水点的带压时段、各保供出口的断水时段（相邻同类区间已合并）
+            与逐出口累计断水分钟，并列出每次原子变更明细；空日志按登记状态覆盖整段。
+          </p>
+        </div>
+      </section>
     </div>
   </main>
 `;
@@ -371,6 +418,9 @@ const routeStartEl = el<HTMLInputElement>('#route-start');
 const deliveryStationsEl = el<HTMLInputElement>('#delivery-stations');
 const deliveryMaxWalkEl = el<HTMLInputElement>('#delivery-max-walk');
 const outletWaypointsEl = el<HTMLTextAreaElement>('#outlet-waypoints');
+const auditStartEl = el<HTMLInputElement>('#audit-start');
+const auditEndEl = el<HTMLInputElement>('#audit-end');
+const valveAuditLogEl = el<HTMLTextAreaElement>('#valve-audit-log');
 const selectedSolutionHintEl = el<HTMLParagraphElement>('#selected-solution-hint');
 const resultEl = el<HTMLDivElement>('#result');
 const inspectResultEl = el<HTMLDivElement>('#inspect-result');
@@ -385,6 +435,7 @@ const anomalyResultEl = el<HTMLDivElement>('#anomaly-result');
 const observerResultEl = el<HTMLDivElement>('#observer-result');
 const deliveryFormEl = el<HTMLDivElement>('#delivery-form');
 const deliveryResultEl = el<HTMLDivElement>('#delivery-result');
+const valveAuditResultEl = el<HTMLDivElement>('#valve-audit-result');
 
 /** 已生成填写表对应的供水点 / 保供出口。 */
 interface CapacityFormState {
@@ -1548,6 +1599,144 @@ function renderEmergencyDelivery(result: EmergencyDeliveryResult): void {
     </p>`;
 }
 
+/** 左闭右开区间格式化为 [from, to)；空清单返回占位文本。 */
+function formatIntervals(intervals: { from: number; to: number }[]): string {
+  if (intervals.length === 0) return '<span class="hint">—</span>';
+  return intervals.map((iv) => `<code>[${iv.from}, ${iv.to})</code>`).join('、');
+}
+
+function renderValveAudit(result: ValveAuditResult): void {
+  if (result.status === 'invalid') {
+    renderErrors(valveAuditResultEl, '输入有误，无法审计：', result.errors);
+    return;
+  }
+
+  const outletRows = result.outletRows
+    .map((r) => {
+      const cut = r.outageMinutes > 0;
+      return `
+      <tr>
+        <td>${escapeHtml(r.outlet)}</td>
+        <td>${formatIntervals(r.outageIntervals)}</td>
+        <td class="num ${cut ? 'bad' : 'ok'}"><strong>${r.outageMinutes}</strong></td>
+        <td>${cut ? '<span class="tag tag-cut">有断水</span>' : '<span class="tag tag-ok">全程未断</span>'}</td>
+      </tr>`;
+    })
+    .join('');
+
+  // 逐次原子变更明细：分钟 / 本次阀门操作（前→后开闭）/ 变更后漏点与各出口状态
+  const changeRows = result.changes
+    .map((ch) => {
+      const ops = ch.operations
+        .map((op) => {
+          const fromTag = op.fromOpen ? '开' : '关';
+          const toTag = op.toOpen ? '开' : '关';
+          return `<code>${escapeHtml(op.valve)}</code>（${fromTag}→${toTag}）`;
+        })
+        .join('、');
+      const outletState =
+        result.outlets.length > 0
+          ? ch.outletsConnected
+              .map(
+                (connected, i) =>
+                  `${escapeHtml(result.outlets[i])}：${
+                    connected
+                      ? '<span class="tag tag-ok">通</span>'
+                      : '<span class="tag tag-cut">断</span>'
+                  }`
+              )
+              .join('　')
+          : '<span class="hint">（无保供出口）</span>';
+      return `
+      <tr>
+        <td class="num"><strong>${ch.minute}</strong></td>
+        <td>${ops}</td>
+        <td>${ch.leakPressurized ? '<span class="tag tag-cut">带压</span>' : '<span class="tag tag-ok">已隔离</span>'}</td>
+        <td>${outletState}</td>
+      </tr>`;
+    })
+    .join('');
+
+  // 时间轴分段：每段标注漏点带压 / 已隔离与各出口通断（按时间排列）
+  const segmentRows = result.segments
+    .map((seg) => {
+      const outlets =
+        result.outlets.length > 0
+          ? seg.outletsConnected
+              .map(
+                (connected, i) =>
+                  `${escapeHtml(result.outlets[i])}：${
+                    connected
+                      ? '<span class="tag tag-ok">通</span>'
+                      : '<span class="tag tag-cut">断</span>'
+                  }`
+              )
+              .join('　')
+          : '<span class="hint">（无保供出口）</span>';
+      return `
+      <tr>
+        <td><code>[${seg.from}, ${seg.to})</code></td>
+        <td class="num">${seg.to - seg.from}</td>
+        <td>${seg.leakPressurized ? '<span class="tag tag-cut">漏点带压</span>' : '<span class="tag tag-ok">漏点已隔离</span>'}</td>
+        <td>${outlets}</td>
+        <td>${seg.changeMinute === null ? '<span class="hint">登记状态</span>' : `第 ${seg.changeMinute} 分钟变更后`}</td>
+      </tr>`;
+    })
+    .join('');
+
+  const leakText =
+    result.leakPressurizedMinutes > 0
+      ? `漏点在 <strong>${result.leakPressurizedMinutes}</strong> 分钟内仍连通供水点（带压），需重点核对隔离操作。`
+      : '整个审计时段漏点均与全部供水点断开（带压 0 分钟）。';
+  const outageText =
+    result.totalOutageMinutes > 0
+      ? `各出口断水分钟合计 <strong>${result.totalOutageMinutes}</strong>（逐出口累计见下表）。`
+      : '整个审计时段各保供出口均未断水。';
+
+  valveAuditResultEl.innerHTML = `
+    <div class="banner ${result.leakPressurizedMinutes > 0 || result.totalOutageMinutes > 0 ? 'warn' : 'success'}">
+      审计区间 <code>[${result.startMinute}, ${result.endMinute})</code>（共 ${result.totalMinutes} 分钟），
+      实际操作记录 <strong>${result.recordCount}</strong> 条、原子变更 <strong>${result.changes.length}</strong> 次。
+      ${leakText}<br />${outageText}
+    </div>
+    <h3>漏点带压时段（仍连通至少一个供水点，左闭右开、相邻已合并）</h3>
+    <p>${formatIntervals(result.leakPressurizedIntervals)}
+       <span class="hint">（累计 ${result.leakPressurizedMinutes} 分钟）</span></p>
+    <h3>逐保供出口断水时段与累计断水分钟</h3>
+    <table>
+      <thead>
+        <tr><th>保供出口</th><th>断水时段（无法连通任一供水点）</th><th>累计断水分钟</th><th>状态</th></tr>
+      </thead>
+      <tbody>${outletRows || '<tr><td colspan="4" class="hint">（未指定保供出口）</td></tr>'}</tbody>
+    </table>
+    <details open>
+      <summary>逐次原子变更明细（${result.changes.length} 次）</summary>
+      ${
+        result.changes.length > 0
+          ? `<table>
+              <thead>
+                <tr><th>分钟</th><th>本次原子变更（同分钟不同阀门同时生效）</th><th>变更后漏点</th><th>变更后各出口</th></tr>
+              </thead>
+              <tbody>${changeRows}</tbody>
+            </table>`
+          : '<p class="hint">空日志：整段按阀门登记状态覆盖，未发生任何变更。</p>'
+      }
+    </details>
+    <details>
+      <summary>回放时间轴分段（${result.segments.length} 段）</summary>
+      <table>
+        <thead>
+          <tr><th>时段（左闭右开）</th><th>分钟数</th><th>漏点状态</th><th>各出口状态</th><th>状态来源</th></tr>
+        </thead>
+        <tbody>${segmentRows}</tbody>
+      </table>
+    </details>
+    <p class="hint">
+      每次变更后均按「无阀管段 + 开启阀门」重算供水点可达节点；同分钟对不同阀门的操作视为一次原子变更。
+      审计为纯函数回放测算，<strong>不修改拓扑 JSON 与登记的阀门状态</strong>。
+    </p>`;
+}
+
 function readNetwork(): import('./solver').Network {
   let raw: unknown;
   try {
@@ -1850,6 +2039,45 @@ function runDeliveryPlan(): void {
   }
 }
 
+function runValveAudit(): void {
+  try {
+    const { network, query } = readQuery();
+    const startText = auditStartEl.value.trim();
+    const endText = auditEndEl.value.trim();
+    const localErrors: string[] = [];
+    if (!/^\d+$/.test(startText)) localErrors.push('起始分钟必须是非负整数。');
+    if (!/^\d+$/.test(endText)) localErrors.push('结束分钟必须是非负整数。');
+    const logText = valveAuditLogEl.value.trim();
+    let records: unknown;
+    if (logText === '') {
+      records = []; // 空日志：整段按登记状态覆盖
+    } else {
+      try {
+        records = JSON.parse(logText);
+      } catch (e) {
+        renderErrors(valveAuditResultEl, '操作记录 JSON 解析失败：', [(e as Error).message]);
+        return;
+      }
+    }
+    if (localErrors.length > 0) {
+      renderErrors(valveAuditResultEl, '填写有误：', localErrors);
+      return;
+    }
+    renderValveAudit(
+      auditValveOperationWindow(network, {
+        supplies: query.supplies,
+        leak: query.leak,
+        outlets: query.outlets,
+        startMinute: Number(startText),
+        endMinute: Number(endText),
+        records: records as import('./solver').ValveOperationRecord[],
+      })
+    );
+  } catch (e) {
+    renderErrors(valveAuditResultEl, '拓扑校验失败：', (e as { topologyErrors: string[] }).topologyErrors);
+  }
+}
+
 el<HTMLButtonElement>('#load-sample').addEventListener('click', () => {
   topologyEl.value = JSON.stringify(SAMPLE_NETWORK, null, 2);
   suppliesEl.value = SAMPLE_QUERY.supplies.join(', ');
@@ -1863,6 +2091,9 @@ el<HTMLButtonElement>('#load-sample').addEventListener('click', () => {
   deliveryStationsEl.value = SAMPLE_DELIVERY_STATIONS.join(', ');
   deliveryMaxWalkEl.value = String(SAMPLE_DELIVERY_MAX_WALK);
   outletWaypointsEl.value = JSON.stringify(SAMPLE_OUTLET_WAYPOINTS, null, 2);
+  auditStartEl.value = String(SAMPLE_VALVE_AUDIT_START);
+  auditEndEl.value = String(SAMPLE_VALVE_AUDIT_END);
+  valveAuditLogEl.value = JSON.stringify(SAMPLE_VALVE_AUDIT_RECORDS, null, 2);
   buildCapacityForm(
     SAMPLE_QUERY.supplies,
     SAMPLE_QUERY.outlets,
@@ -1881,6 +2112,7 @@ el<HTMLButtonElement>('#load-sample').addEventListener('click', () => {
   runObserverPlan();
   runClosureRoute();
   runDeliveryPlan();
+  runValveAudit();
 });
 
 el<HTMLButtonElement>('#solve').addEventListener('click', run);
@@ -1894,6 +2126,7 @@ el<HTMLButtonElement>('#locate-anomaly').addEventListener('click', runAnomaly);
 el<HTMLButtonElement>('#plan-observers').addEventListener('click', runObserverPlan);
 el<HTMLButtonElement>('#plan-closure-route').addEventListener('click', runClosureRoute);
 el<HTMLButtonElement>('#plan-delivery').addEventListener('click', runDeliveryPlan);
+el<HTMLButtonElement>('#run-valve-audit').addEventListener('click', runValveAudit);
 el<HTMLButtonElement>('#build-delivery-form').addEventListener('click', () => {
   const stations = [...new Set(splitList(deliveryStationsEl.value))];
   if (stations.length > MAX_DELIVERY_STATIONS) {

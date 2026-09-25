@@ -2937,3 +2937,411 @@ export function planEmergencyDeliveryStations(
       '请增设更靠近这些出口取水口的候选站、提高站可送水量或放宽最大步行分钟后重试。',
   };
 }
+
+// ============ 检修阀门操作时段审计 ============
+
+/** 操作日志最多接受的实际操作记录条数。 */
+export const MAX_VALVE_AUDIT_RECORDS = 100;
+
+/** 一条实际阀门操作记录：在 minute 分钟把阀门 valve 操作到 open 目标开闭状态。 */
+export interface ValveOperationRecord {
+  minute: number;
+  valve: string;
+  open: boolean;
+}
+
+/** 检修阀门操作时段审计查询。 */
+export interface ValveAuditQuery {
+  /** 供水点节点 */
+  supplies: string[];
+  /** 漏点节点 */
+  leak: string;
+  /** 保供出口节点 */
+  outlets: string[];
+  /** 审计起始整数分钟（含） */
+  startMinute: number;
+  /** 审计结束整数分钟（不含） */
+  endMinute: number;
+  /** 实际操作记录（最多 MAX_VALVE_AUDIT_RECORDS 条），无需按分钟排序 */
+  records: ValveOperationRecord[];
+}
+
+/** 左闭右开整数分钟区间 [from, to)。 */
+export interface MinuteInterval {
+  from: number;
+  to: number;
+}
+
+/** 同分钟对不同阀门的一次原子变更明细。 */
+export interface ValveAuditOperation {
+  /** 被操作的阀门编号 */
+  valve: string;
+  /** 变更前开闭状态 */
+  fromOpen: boolean;
+  /** 目标开闭状态（变更后） */
+  toOpen: boolean;
+}
+
+/** 回放中的一次原子变更（同一分钟的不同阀门操作视为一次）。 */
+export interface ValveAuditChange {
+  /** 变更发生的分钟（变更自该分钟起生效） */
+  minute: number;
+  /** 本次原子变更的全部阀门操作，按阀门编号升序 */
+  operations: ValveAuditOperation[];
+  /** 变更后漏点是否仍连通至少一个供水点（带压） */
+  leakPressurized: boolean;
+  /** 变更后各保供出口是否能连通至少一个供水点（按查询中保供出口顺序） */
+  outletsConnected: boolean[];
+}
+
+/** 回放时间轴上的一段：自 [from, to) 内无任何变更，连通状态保持不变。 */
+export interface ValveAuditSegment {
+  from: number;
+  to: number;
+  /** 本段起始（= 上一次变更后）漏点是否带压 */
+  leakPressurized: boolean;
+  /** 本段各保供出口是否连通供水点（按查询中保供出口顺序） */
+  outletsConnected: boolean[];
+  /** 造成本段状态的变更分钟；审计起点段为 null */
+  changeMinute: number | null;
+}
+
+/** 单个保供出口的断水审计结果。 */
+export interface ValveAuditOutletRow {
+  outlet: string;
+  /** 断水（无法连通任一供水点）时段，左闭右开、相邻已合并 */
+  outageIntervals: MinuteInterval[];
+  /** 累计断水分钟（= 各断水时段长度之和） */
+  outageMinutes: number;
+}
+
+export interface ValveAuditOk {
+  status: 'ok';
+  startMinute: number;
+  endMinute: number;
+  /** 审计总分钟数 = endMinute - startMinute */
+  totalMinutes: number;
+  /** 实际操作记录条数 */
+  recordCount: number;
+  /** 去重后保供出口顺序 */
+  outlets: string[];
+  /** 漏点仍连通至少一个供水点的带压时段（左闭右开、相邻已合并） */
+  leakPressurizedIntervals: MinuteInterval[];
+  /** 漏点带压累计分钟 */
+  leakPressurizedMinutes: number;
+  /** 逐保供出口断水时段与累计断水分钟（按查询中保供出口顺序） */
+  outletRows: ValveAuditOutletRow[];
+  /** 全部保供出口断水分钟合计 */
+  totalOutageMinutes: number;
+  /** 回放时间轴分段（按时间排列，零长度段不含） */
+  segments: ValveAuditSegment[];
+  /** 逐次原子变更（按分钟升序） */
+  changes: ValveAuditChange[];
+}
+
+export interface ValveAuditInvalid {
+  status: 'invalid';
+  errors: string[];
+}
+
+export type ValveAuditResult = ValveAuditOk | ValveAuditInvalid;
+
+/** 合并左闭右开区间序列中相邻（前一个 to === 下一个 from）的同类区间。 */
+function mergeAdjacentIntervals(intervals: MinuteInterval[]): MinuteInterval[] {
+  const merged: MinuteInterval[] = [];
+  for (const iv of intervals) {
+    if (iv.from >= iv.to) continue; // 不产生零长度区间
+    const last = merged[merged.length - 1];
+    if (last && last.to === iv.from) {
+      last.to = iv.to;
+    } else {
+      merged.push({ from: iv.from, to: iv.to });
+    }
+  }
+  return merged;
+}
+
+/**
+ * 检修阀门操作时段审计：沿用当前拓扑、供水点、漏点与保供出口（不改登记状态），
+ * 在 [startMinute, endMinute) 整数分钟区间内，从阀门登记开闭状态起按分钟回放
+ * 实际操作日志。
+ *
+ * - 同一分钟对不同阀门的操作视为一次原子变更：该分钟全部阀门目标状态同时生效后
+ *   才按「无阀管段 + 开启阀门」重算供水点可达节点；
+ * - 同一分钟重复操作同一阀门、未知阀门编号或越界时间（分钟不在 [start,end) 内）
+ *   一律报输入错误；操作记录最多 100 条；
+ * - 以左闭右开区间记录漏点仍连通至少一个供水点的带压时段，以及各保供出口无法
+ *   连通任一供水点的断水时段，相邻同类区间合并；给出逐出口累计断水分钟；
+ * - 空日志时整段按登记状态覆盖；审计为纯函数测算，不修改拓扑与登记的阀门状态。
+ */
+export function auditValveOperationWindow(
+  network: Network,
+  query: ValveAuditQuery
+): ValveAuditResult {
+  const errors: string[] = [];
+  const nodeSet = new Set(network.nodes);
+
+  if (query.supplies.length === 0) errors.push('至少需要指定一个供水点。');
+  for (const s of query.supplies) {
+    if (!nodeSet.has(s)) errors.push(`供水点「${s}」不在节点列表中。`);
+  }
+  if (!query.leak) {
+    errors.push('必须指定漏点。');
+  } else if (!nodeSet.has(query.leak)) {
+    errors.push(`漏点「${query.leak}」不在节点列表中。`);
+  }
+  if (query.leak && query.supplies.includes(query.leak)) {
+    errors.push(`漏点「${query.leak}」不能同时是供水点。`);
+  }
+  const outlets = uniquePreservingOrder(query.outlets);
+  for (const o of outlets) {
+    if (!nodeSet.has(o)) errors.push(`保供出口「${o}」不在节点列表中。`);
+  }
+
+  if (
+    typeof query.startMinute !== 'number' ||
+    !Number.isSafeInteger(query.startMinute) ||
+    query.startMinute < 0
+  ) {
+    errors.push(`起始分钟必须是非负整数（收到：${String(query.startMinute)}）。`);
+  }
+  if (
+    typeof query.endMinute !== 'number' ||
+    !Number.isSafeInteger(query.endMinute) ||
+    query.endMinute < 0
+  ) {
+    errors.push(`结束分钟必须是非负整数（收到：${String(query.endMinute)}）。`);
+  }
+  if (
+    typeof query.startMinute === 'number' &&
+    Number.isSafeInteger(query.startMinute) &&
+    typeof query.endMinute === 'number' &&
+    Number.isSafeInteger(query.endMinute) &&
+    query.startMinute >= 0 &&
+    query.endMinute >= 0 &&
+    query.startMinute > query.endMinute
+  ) {
+    errors.push(
+      `起始分钟（${query.startMinute}）不能晚于结束分钟（${query.endMinute}）；区间左闭右开。`
+    );
+  }
+
+  if (!Array.isArray(query.records)) {
+    errors.push('实际操作记录必须是数组（每项含 minute / valve / open）。');
+  } else if (query.records.length > MAX_VALVE_AUDIT_RECORDS) {
+    errors.push(
+      `实际操作记录有 ${query.records.length} 条，超过上限 ${MAX_VALVE_AUDIT_RECORDS} 条；请精简日志后再审计。`
+    );
+  }
+
+  if (errors.length > 0) return { status: 'invalid', errors };
+
+  const startMinute = query.startMinute as number;
+  const endMinute = query.endMinute as number;
+  const records = (query.records as ValveOperationRecord[]) ?? [];
+
+  // 逐条校验记录结构与值域；结构合法的记录再参与同分钟重复阀门与越界判定
+  const parsed: ValveOperationRecord[] = [];
+  const knownValves = new Set(network.valvedPipes.map((v) => v.id));
+  records.forEach((rec, i) => {
+    if (!isRecord(rec)) {
+      errors.push(`操作记录[${i}] 必须是对象，包含 minute（整数分钟）/ valve（阀门编号）/ open（目标开闭）字段。`);
+      return;
+    }
+    if (
+      typeof rec.minute !== 'number' ||
+      !Number.isSafeInteger(rec.minute)
+    ) {
+      errors.push(`操作记录[${i}] 的 minute 必须是整数分钟（收到：${String((rec as { minute?: unknown }).minute)}）。`);
+    }
+    if (typeof rec.valve !== 'string' || !rec.valve) {
+      errors.push(`操作记录[${i}] 的 valve 必须是非空阀门编号。`);
+    }
+    if (typeof rec.open !== 'boolean') {
+      errors.push(`操作记录[${i}] 的 open 必须是布尔值（true 开启 / false 关闭，收到：${String((rec as { open?: unknown }).open)}）。`);
+    }
+    if (
+      typeof rec.minute === 'number' &&
+      Number.isSafeInteger(rec.minute) &&
+      typeof rec.valve === 'string' &&
+      !!rec.valve &&
+      typeof rec.open === 'boolean'
+    ) {
+      if (rec.minute < startMinute || rec.minute >= endMinute) {
+        errors.push(
+          `操作记录[${i}] 的分钟 ${rec.minute} 越界：必须落在审计区间 [${startMinute}, ${endMinute}) 内（左闭右开）。`
+        );
+      }
+      if (!knownValves.has(rec.valve)) {
+        errors.push(`操作记录[${i}] 的阀门「${rec.valve}」不在拓扑的带阀管段编号中（未知阀门）。`);
+      }
+      parsed.push({ minute: rec.minute, valve: rec.valve, open: rec.open });
+    }
+  });
+
+  // 按分钟分组（保持日志先后顺序），检出同分钟重复操作同一阀门
+  const byMinute = new Map<number, ValveOperationRecord[]>();
+  for (const rec of parsed) {
+    const list = byMinute.get(rec.minute);
+    if (list) {
+      if (list.some((r) => r.valve === rec.valve)) {
+        errors.push(
+          `第 ${rec.minute} 分钟对阀门「${rec.valve}」存在重复操作：同一分钟只能对同一阀门操作一次。`
+        );
+      }
+      list.push(rec);
+    } else {
+      byMinute.set(rec.minute, [rec]);
+    }
+  }
+
+  if (errors.length > 0) return { status: 'invalid', errors };
+
+  // 无阀管段邻接（与阀门状态无关，构建一次）；自环对连通无意义，忽略
+  const indexOf = new Map<string, number>();
+  network.nodes.forEach((node, i) => indexOf.set(node, i));
+  const nNodes = network.nodes.length;
+  const baseAdj: number[][] = Array.from({ length: nNodes }, () => []);
+  for (const p of network.pipes) {
+    if (p.from === p.to) continue;
+    const u = indexOf.get(p.from)!;
+    const v = indexOf.get(p.to)!;
+    baseAdj[u].push(v);
+    baseAdj[v].push(u);
+  }
+
+  // 阀门运行态：自登记状态起回放，审计全程不写回 network
+  const valveOpen = new Map<string, boolean>();
+  for (const vp of network.valvedPipes) valveOpen.set(vp.id, vp.open);
+  const valveEndpoints = new Map(
+    network.valvedPipes
+      .filter((vp) => vp.from !== vp.to)
+      .map((vp) => [vp.id, { u: indexOf.get(vp.from)!, v: indexOf.get(vp.to)! }])
+  );
+
+  const supplies = uniquePreservingOrder(query.supplies);
+  const supplyIdx = supplies.map((s) => indexOf.get(s)!);
+  const leakIdx = indexOf.get(query.leak)!;
+  const outletIdx = outlets.map((o) => indexOf.get(o)!);
+
+  /** 按当前阀门开闭状态，从全部供水点做连通性遍历。 */
+  const reachableSnapshot = (): { leakConnected: boolean; outletsConnected: boolean[] } => {
+    const adj: number[][] = baseAdj.map((row) => [...row]);
+    for (const vp of network.valvedPipes) {
+      if (!valveOpen.get(vp.id)) continue;
+      const ep = valveEndpoints.get(vp.id);
+      if (!ep) continue;
+      adj[ep.u].push(ep.v);
+      adj[ep.v].push(ep.u);
+    }
+    const seen = new Array<boolean>(nNodes).fill(false);
+    const queue: number[] = [];
+    for (const s of supplyIdx) {
+      if (!seen[s]) {
+        seen[s] = true;
+        queue.push(s);
+      }
+    }
+    while (queue.length > 0) {
+      const cur = queue.shift()!;
+      for (const next of adj[cur]) {
+        if (!seen[next]) {
+          seen[next] = true;
+          queue.push(next);
+        }
+      }
+    }
+    return {
+      leakConnected: seen[leakIdx],
+      outletsConnected: outletIdx.map((oi) => seen[oi]),
+    };
+  };
+
+  const initial = reachableSnapshot();
+
+  // 各分钟的原子变更按分钟升序回放；分钟内不同阀门的操作同时生效后只重算一次
+  const changeMinutes = [...byMinute.keys()].sort((a, b) => a - b);
+  const changes: ValveAuditChange[] = [];
+  const segments: ValveAuditSegment[] = [];
+
+  let segStart = startMinute;
+  let segLeak = initial.leakConnected;
+  let segOutlets = initial.outletsConnected;
+  let segChangeMinute: number | null = null;
+
+  const pushSegment = (to: number): void => {
+    if (to > segStart) {
+      segments.push({
+        from: segStart,
+        to,
+        leakPressurized: segLeak,
+        outletsConnected: [...segOutlets],
+        changeMinute: segChangeMinute,
+      });
+    }
+  };
+
+  for (const minute of changeMinutes) {
+    // [segStart, minute) 保持变更前状态
+    pushSegment(minute);
+
+    // 原子应用本分钟全部阀门目标状态，记录每只阀门的前后开闭
+    const operations: ValveAuditOperation[] = [];
+    for (const rec of byMinute.get(minute)!) {
+      const fromOpen = valveOpen.get(rec.valve)!;
+      operations.push({ valve: rec.valve, fromOpen, toOpen: rec.open });
+      valveOpen.set(rec.valve, rec.open);
+    }
+    operations.sort((a, b) => (a.valve < b.valve ? -1 : a.valve > b.valve ? 1 : 0));
+
+    const snap = reachableSnapshot();
+    changes.push({
+      minute,
+      operations,
+      leakPressurized: snap.leakConnected,
+      outletsConnected: [...snap.outletsConnected],
+    });
+
+    segStart = minute;
+    segLeak = snap.leakConnected;
+    segOutlets = snap.outletsConnected;
+    segChangeMinute = minute;
+  }
+  pushSegment(endMinute);
+
+  // 汇总漏点带压时段与逐出口断水时段（左闭右开，合并相邻同类区间）
+  const leakIntervalsRaw: MinuteInterval[] = [];
+  const outageRaw: MinuteInterval[][] = outlets.map(() => []);
+  for (const seg of segments) {
+    if (seg.leakPressurized) leakIntervalsRaw.push({ from: seg.from, to: seg.to });
+    seg.outletsConnected.forEach((connected, oi) => {
+      if (!connected) outageRaw[oi].push({ from: seg.from, to: seg.to });
+    });
+  }
+  const leakPressurizedIntervals = mergeAdjacentIntervals(leakIntervalsRaw);
+  const lengthOf = (ivs: MinuteInterval[]): number => ivs.reduce((sum, iv) => sum + (iv.to - iv.from), 0);
+
+  const outletRows: ValveAuditOutletRow[] = outlets.map((outlet, oi) => {
+    const outageIntervals = mergeAdjacentIntervals(outageRaw[oi]);
+    return {
+      outlet,
+      outageIntervals,
+      outageMinutes: lengthOf(outageIntervals),
+    };
+  });
+
+  return {
+    status: 'ok',
+    startMinute,
+    endMinute,
+    totalMinutes: endMinute - startMinute,
+    recordCount: records.length,
+    outlets,
+    leakPressurizedIntervals,
+    leakPressurizedMinutes: lengthOf(leakPressurizedIntervals),
+    outletRows,
+    totalOutageMinutes: outletRows.reduce((sum, r) => sum + r.outageMinutes, 0),
+    segments,
+    changes,
+  };
+}
