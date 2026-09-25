@@ -441,6 +441,12 @@ button.select-solution-btn.selected {
   white-space: nowrap;
 }
 
+.audit-op {
+  display: inline-block;
+  margin: 2px 8px 2px 0;
+  white-space: nowrap;
+}
+
 .op-no {
   display: inline-block;
   min-width: 20px;

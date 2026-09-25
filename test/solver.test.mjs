@@ -1517,5 +1517,148 @@ const d13 = solver.planEmergencyDeliveryStations(delNet, {
 });
 check('出口节点不存在时透传核验错误', d13.status === 'invalid');
 
+// ============ 检修阀门操作时段审计 ============
+console.log('检修阀门操作时段审计：');
+
+// 漏点 N2 在登记状态下经 S1 侧（V03）与 S2 侧（V05）两路带压
+const au1 = solver.auditValveOperations(network, {
+  supplies: ['S1', 'S2'],
+  leak: 'N2',
+  outlets: ['B', 'C', 'D'],
+  startMinute: 0,
+  endMinute: 60,
+  operations: [
+    { minute: 45, valve: 'V07', open: false },
+    { minute: 10, valve: 'V03', open: false },
+    { minute: 10, valve: 'V04', open: false },
+    { minute: 30, valve: 'V05', open: true }, // 冗余操作（登记即开），允许
+  ],
+});
+check('审计返回 ok', au1.status === 'ok');
+check('记录归并为 3 次原子变更（按分钟排序）',
+  au1.status === 'ok' && au1.changes.length === 3 &&
+  au1.changes.map((c) => c.minute).join(',') === '10,30,45');
+check('第 10 分钟 V03/V04 为同一次原子变更（阀门编号升序）',
+  au1.status === 'ok' && au1.changes[0].operations.map((o) => o.valve).join(',') === 'V03,V04');
+check('漏点带压时段仅 [0,10)（两路在同一次原子变更中全部切断）',
+  au1.status === 'ok' && au1.leakPressurizedIntervals.length === 1 &&
+  au1.leakPressurizedIntervals[0].from === 0 && au1.leakPressurizedIntervals[0].to === 10 &&
+  au1.leakPressurizedMinutes === 10);
+check('出口 D 自第 45 分钟断水，累计 15 分钟',
+  au1.status === 'ok' && (() => {
+    const row = au1.outletRows.find((r) => r.outlet === 'D');
+    return row.outageMinutes === 15 && row.outageIntervals.length === 1 &&
+      row.outageIntervals[0].from === 45 && row.outageIntervals[0].to === 60;
+  })());
+check('出口 B、C 全程连通（断水 0 分钟）',
+  au1.status === 'ok' && au1.outletRows
+    .filter((r) => r.outlet === 'B' || r.outlet === 'C')
+    .every((r) => r.outageMinutes === 0 && r.outageIntervals.length === 0));
+check('分段数为 4（[0,10)、[10,30)、[30,45)、[45,60)）',
+  au1.status === 'ok' && au1.segments.length === 4 &&
+  au1.segments.map((s) => `${s.interval.from}-${s.interval.to}`).join(',') === '0-10,10-30,30-45,45-60');
+
+console.log('审计：相邻同类区间合并与空日志：');
+// 关 V03（10 分钟时漏点仍可经 S2 侧带压）→ 关 V05（20，漏点隔离）→ 开 V05（30，恢复带压）
+// 漏点带压：[0,20) 与 [30,60)；验证合并与分段
+const au2 = solver.auditValveOperations(network, {
+  supplies: ['S1', 'S2'],
+  leak: 'N2',
+  outlets: ['B'],
+  startMinute: 0,
+  endMinute: 60,
+  operations: [
+    { minute: 10, valve: 'V03', open: false },
+    { minute: 20, valve: 'V05', open: false },
+    { minute: 30, valve: 'V05', open: true },
+  ],
+});
+check('漏点带压时段合并为 [0,20) 与 [30,60) 两段（带压 50 分钟）',
+  au2.status === 'ok' && au2.leakPressurizedIntervals.length === 2 &&
+  au2.leakPressurizedIntervals.map((i) => `${i.from}-${i.to}`).join(',') === '0-20,30-60' &&
+  au2.leakPressurizedMinutes === 50);
+check('漏点隔离时段不出现在带压清单中',
+  au2.status === 'ok' && !au2.leakPressurizedIntervals.some((i) => i.from === 20));
+
+// 空日志：整段按登记状态，漏点全程带压、出口全程连通
+const au3 = solver.auditValveOperations(network, {
+  supplies: ['S1', 'S2'],
+  leak: 'N2',
+  outlets: ['B', 'C', 'D'],
+  startMinute: 5,
+  endMinute: 25,
+  operations: [],
+});
+check('空日志：单段覆盖整段，漏点全程带压',
+  au3.status === 'ok' && au3.emptyLog === true && au3.changes.length === 0 &&
+  au3.segments.length === 1 && au3.segments[0].interval.from === 5 &&
+  au3.segments[0].interval.to === 25 && au3.leakPressurizedMinutes === 20);
+check('空日志：全部出口累计断水 0 分钟',
+  au3.status === 'ok' && au3.outletRows.every((r) => r.outageMinutes === 0));
+
+// 出口自段首即断水、持续整段（V09 登记为关，B 仍可经 V08 连通；构造真正断水的出口）
+const auCutNet = {
+  nodes: ['S', 'X', 'O'],
+  pipes: [],
+  valvedPipes: [
+    { id: 'V1', from: 'S', to: 'X', open: true },
+    { id: 'V2', from: 'X', to: 'O', open: false },
+  ],
+};
+const au4 = solver.auditValveOperations(auCutNet, {
+  supplies: ['S'],
+  leak: 'X',
+  outlets: ['O'],
+  startMinute: 0,
+  endMinute: 10,
+  operations: [],
+});
+check('登记即断水的出口：空日志下断水时段覆盖整段 [0,10)',
+  au4.status === 'ok' && au4.outletRows[0].outageMinutes === 10 &&
+  au4.outletRows[0].outageIntervals[0].from === 0 &&
+  au4.outletRows[0].outageIntervals[0].to === 10);
+
+console.log('审计：校验错误：');
+const auErr = (patch) => solver.auditValveOperations(network, {
+  supplies: ['S1', 'S2'],
+  leak: 'N2',
+  outlets: ['B'],
+  startMinute: 0,
+  endMinute: 60,
+  operations: [],
+  ...patch,
+});
+const auE1 = auErr({ operations: [{ minute: 10, valve: 'V03', open: false }, { minute: 10, valve: 'V03', open: true }] });
+check('同分钟重复操作同一阀门报错', auE1.status === 'invalid' && auE1.errors.some((e) => e.includes('重复')));
+const auE2 = auErr({ operations: [{ minute: 10, valve: 'V99', open: false }] });
+check('未知阀门报错', auE2.status === 'invalid' && auE2.errors.some((e) => e.includes('V99')));
+const auE3 = auErr({ operations: [{ minute: 60, valve: 'V03', open: false }] });
+check('越界（=结束分钟，右端点不含）报错', auE3.status === 'invalid' && auE3.errors.some((e) => e.includes('越界')));
+const auE4 = auErr({ operations: [{ minute: -1, valve: 'V03', open: false }] });
+check('负分钟报错（同时越界）', auE4.status === 'invalid');
+const auE5 = auErr({ startMinute: 60, endMinute: 60 });
+check('起始不小于结束报错', auE5.status === 'invalid' && auE5.errors.some((e) => e.includes('必须小于')));
+const auE6 = auErr({ operations: [{ minute: 10, valve: 'V03' }] });
+check('缺少 open 布尔字段报错', auE6.status === 'invalid');
+const auE7 = auErr({ startMinute: 1.5, endMinute: 60 });
+check('起始分钟为小数报错', auE7.status === 'invalid');
+const auE8 = auErr({ leak: 'N2', supplies: ['S1', 'N2'] });
+check('漏点同时是供水点报错', auE8.status === 'invalid');
+
+const tooMany = Array.from({ length: 101 }, (_, i) => ({ minute: i % 60, valve: 'V01', open: false }));
+const auE9 = auErr({ operations: tooMany });
+check('超过 100 条记录被拒绝（先报条数，不被同分钟重复淹没）',
+  auE9.status === 'invalid' && auE9.errors.some((e) => e.includes('100')));
+
+console.log('审计：纯函数不改输入：');
+const auditOpsInput = [{ minute: 10, valve: 'V03', open: false }];
+const beforeAuditNet = JSON.stringify(network);
+solver.auditValveOperations(network, {
+  supplies: ['S1', 'S2'], leak: 'N2', outlets: ['B'],
+  startMinute: 0, endMinute: 60, operations: auditOpsInput,
+});
+check('审计不修改拓扑', JSON.stringify(network) === beforeAuditNet);
+check('审计不修改操作记录输入', auditOpsInput.length === 1 && auditOpsInput[0].valve === 'V03');
+
 console.log(`\n${passed} 通过, ${failed} 失败`);
 process.exit(failed > 0 ? 1 : 0);

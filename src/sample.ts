@@ -162,3 +162,24 @@ export const SAMPLE_OUTLET_WAYPOINTS: Record<string, string> = {
   咖啡厅: '咖啡厅取水口',
   卫生间: '卫生间检修口',
 };
+
+/**
+ * 示例检修阀门操作时段审计：回放起止整数分钟（左闭右开 [0, 60)）。
+ */
+export const SAMPLE_AUDIT_START_MINUTE = 0;
+export const SAMPLE_AUDIT_END_MINUTE = 60;
+
+/**
+ * 示例检修阀门操作时段审计：实际操作记录（最多 100 条）。
+ * 登记状态下漏点「环管N2」经 S1 侧与 S2 侧两条路径带压：
+ * - 第 10 分钟同分钟关闭 V03、V04（一次原子变更），漏点自第 10 分钟起与全部供水点断开；
+ * - 第 45 分钟关闭 V07，出口「卫生间」自第 45 分钟起断水（直至第 60 分钟审计结束）；
+ * - 第 30 分钟把登记本就开启的 V05 再次置为开启（无实际影响的冗余操作，允许出现）。
+ * 因此漏点带压时段为 [0,10)，卫生间断水时段为 [45,60)；记录顺序故意打乱，回放按分钟排序。
+ */
+export const SAMPLE_VALVE_OPERATIONS = [
+  { minute: 45, valve: 'V07', open: false },
+  { minute: 10, valve: 'V03', open: false },
+  { minute: 10, valve: 'V04', open: false },
+  { minute: 30, valve: 'V05', open: true },
+];
